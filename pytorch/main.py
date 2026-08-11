@@ -16,7 +16,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from data import ModelNet40
+#from data import ModelNet40
+from data_py import ModelNet40PyG
 from model import PointNet, DGCNN
 import numpy as np
 from torch.utils.data import DataLoader
@@ -37,9 +38,9 @@ def _init_():
     os.system('cp data.py checkpoints' + '/' + args.exp_name + '/' + 'data.py.backup')
 
 def train(args, io):
-    train_loader = DataLoader(ModelNet40(partition='train', num_points=args.num_points), num_workers=8,
+    train_loader = DataLoader(ModelNet40PyG(partition='train', num_points=args.num_points), num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points), num_workers=8,
+    test_loader = DataLoader(ModelNet40PyG(partition='test', num_points=args.num_points), num_workers=8,
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
@@ -136,7 +137,7 @@ def train(args, io):
 
 
 def test(args, io):
-    test_loader = DataLoader(ModelNet40(partition='test', num_points=args.num_points),
+    test_loader = DataLoader(ModelNet40PyG(partition='test', num_points=args.num_points),
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
