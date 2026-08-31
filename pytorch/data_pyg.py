@@ -1,7 +1,9 @@
+
 import torch
 from torch.utils.data import Dataset
 from torch_geometric.datasets import ModelNet
-from torch_geometric.transforms import Compose, SamplePoints, NormalizeScale
+from torch_geometric.transforms import Compose, SamplePoints, NormalizeScale, KNNGraph, FaceToEdge
+from complexity_score import compute_complexity_score
 
 class TranslatePointCloud:
     def __call__(self, data):
@@ -28,6 +30,7 @@ test_transform = Compose([
     NormalizeScale(),
 ])
 
+
 class ModelNet40PyG(Dataset):
     """Wraps torch_geometric ModelNet, returns (pointcloud, label) like the old ModelNet40."""
     def __init__(self, num_points, partition='train'):
@@ -38,9 +41,10 @@ class ModelNet40PyG(Dataset):
 
     def __getitem__(self, item):
         data = self.dataset[item]
-        pointcloud = data.pos[:self.num_points]        # (N, 3) float32
+        pointcloud = data.pos[:self.num_points]# (N, 3) float32
+        ect_features = compute_complexity_score(data)
         label = data.y                                  # scalar tensor
-        return pointcloud, label
+        return pointcloud, ect_features, label
 
     def __len__(self):
         return len(self.dataset)
