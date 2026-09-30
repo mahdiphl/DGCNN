@@ -15,7 +15,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from data_pyg import ModelNet40PyG
-from dgcnn_ect_gated import DGCNN
+from edge_weights import DGCNN
 from model import PointNet  # was missing: --model pointnet crashed with NameError without this
 import numpy as np
 from torch.utils.data import DataLoader
