@@ -2,316 +2,170 @@
 import argparse
 import logging
 import random
-import shutil
-from pathlib import Path
+import tarfile
+from pathlib import Path, PurePosixPath
 from tempfile import TemporaryDirectory
 
 try:
-    from huggingface_hub import HfApi, snapshot_download
+    from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 except ImportError as exc:
     raise ImportError(
-        "huggingface_hub is required to download DONUT. "
-        "Install it with `pip install huggingface_hub`."
+        "huggingface_hub is required. Install it with `pip install huggingface_hub`."
     ) from exc
-
 
 LOGGER = logging.getLogger("get_donut")
 REPO_ID = "LouisM2001/donut"
 METADATA_PATTERNS = ["*.csv", "*.md", "*.txt", "*.json"]
 
+# member suffix (after "<key>.") -> destination subfolder
+PCD_KIND = "pcd.npy"
+OBJ_KINDS = {"vertices.npy", "faces.npy"}
+JSON_KIND = "json"
+
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description=(
-            "Download the DONUT dataset (or a subset of it) from Hugging Face "
-            "and flatten shard directories."
-        ),
+    p = argparse.ArgumentParser(
+        description="Download the DONUT WebDataset shards from Hugging Face and "
+        "extract them into flat pcd/ (and obj/) directories."
     )
-    parser.add_argument(
-        "destination",
-        type=Path,
-        help="Destination directory where the dataset should be materialized.",
-    )
-    parser.add_argument(
-        "--revision",
-        type=str,
-        default="main",
-        help="Dataset revision to download (branch, tag, or commit hash). Default: main.",
-    )
-    parser.add_argument(
-        "--force_download",
-        action="store_true",
-        help="Force re-download even if files are already cached by huggingface_hub.",
-    )
-    parser.add_argument(
-        "--overwrite",
-        action="store_true",
-        help="Overwrite existing local files in the destination directory.",
-    )
+    p.add_argument("destination", type=Path)
+    p.add_argument("--revision", default="main")
+    p.add_argument("--force_download", action="store_true")
+    p.add_argument("--overwrite", action="store_true")
 
-    subset = parser.add_argument_group("subset selection")
-    subset.add_argument(
-        "--pcd_fraction",
-        type=float,
-        default=None,
-        help="Fraction (0-1] of pcd/*.npy files to download, e.g. 0.05 for 5%%.",
-    )
-    subset.add_argument(
-        "--pcd_count",
-        type=int,
-        default=None,
-        help="Exact number of pcd/*.npy files to download (overrides --pcd_fraction).",
-    )
-    subset.add_argument(
-        "--seed",
-        type=int,
-        default=0,
-        help="Random seed so the same subset is selected each run. Default: 0.",
-    )
-    subset.add_argument(
-        "--first",
-        action="store_true",
-        help="Take the first N pcd files (sorted by path) instead of a random sample.",
-    )
-    subset.add_argument(
-        "--skip_obj",
-        action="store_true",
-        help="Do not download any obj/*.npz files.",
-    )
-    subset.add_argument(
-        "--match_obj",
-        action="store_true",
-        help=(
-            "Only download obj/*.npz files whose file stem matches a selected "
-            "pcd/*.npy file (assumes obj and pcd share names)."
-        ),
-    )
-    return parser.parse_args()
+    g = p.add_argument_group("subset selection")
+    g.add_argument("--splits", nargs="+", default=["train", "test"],
+                   choices=["train", "test"], help="Which splits' shards to use.")
+    g.add_argument("--num_shards", type=int, default=None,
+                   help="Number of shards to download (after --splits filtering). "
+                        "This is what saves bandwidth.")
+    g.add_argument("--pcd_fraction", type=float, default=None,
+                   help="Fraction (0-1] of samples to keep from the downloaded shards.")
+    g.add_argument("--pcd_count", type=int, default=None,
+                   help="Exact number of samples to keep (overrides --pcd_fraction).")
+    g.add_argument("--seed", type=int, default=0)
+    g.add_argument("--first", action="store_true",
+                   help="Take the first shards / samples (sorted) instead of random ones.")
+    g.add_argument("--skip_obj", action="store_true",
+                   help="Do not extract vertices/faces mesh files.")
+    g.add_argument("--skip_json", action="store_true",
+                   help="Do not extract per-sample json files.")
+    return p.parse_args()
 
 
-def configure_logging() -> None:
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-    )
-
-
-def ensure_destination(path: Path, skip_obj: bool) -> None:
-    path.mkdir(parents=True, exist_ok=True)
-    if not skip_obj:
-        (path / "obj").mkdir(exist_ok=True)
-    (path / "pcd").mkdir(exist_ok=True)
-
-
-def validate_args(args: argparse.Namespace) -> None:
-    if args.pcd_fraction is not None and not 0 < args.pcd_fraction <= 1:
-        raise ValueError("--pcd_fraction must be in the range (0, 1].")
-    if args.pcd_count is not None and args.pcd_count < 1:
+def validate_args(a: argparse.Namespace) -> None:
+    if a.pcd_fraction is not None and not 0 < a.pcd_fraction <= 1:
+        raise ValueError("--pcd_fraction must be in (0, 1].")
+    if a.pcd_count is not None and a.pcd_count < 1:
         raise ValueError("--pcd_count must be >= 1.")
-    if args.skip_obj and args.match_obj:
-        raise ValueError("--skip_obj and --match_obj cannot be used together.")
+    if a.num_shards is not None and a.num_shards < 1:
+        raise ValueError("--num_shards must be >= 1.")
 
 
-def select_files(
-    revision: str,
-    fraction: float | None,
-    count: int | None,
-    seed: int,
-    first: bool,
-    skip_obj: bool,
-    match_obj: bool,
-) -> tuple[list[str] | None, list[str] | None]:
-    """Return (pcd_files, obj_files).
+def split_member(name: str) -> tuple[str, str]:
+    """'<key>.pcd.npy' -> ('<key>', 'pcd.npy')."""
+    base = PurePosixPath(name).name
+    key, _, kind = base.partition(".")
+    return key, kind
 
-    A value of None means "no subsetting requested; download everything
-    of that kind using a glob pattern".
-    """
-    subset_requested = fraction is not None or count is not None
-    if not subset_requested and not match_obj:
-        return None, None
 
-    api = HfApi()
-    all_files = api.list_repo_files(REPO_ID, repo_type="dataset", revision=revision)
-
-    pcd_files = sorted(
-        f for f in all_files if f.startswith("pcd/") and f.endswith(".npy")
+def choose_shards(a: argparse.Namespace) -> list[str]:
+    files = HfApi().list_repo_files(REPO_ID, repo_type="dataset", revision=a.revision)
+    shards = sorted(
+        f for f in files if f.endswith(".tar") and f.split("/")[0] in set(a.splits)
     )
-    if not pcd_files:
-        raise RuntimeError("No pcd/*.npy files found in the repository.")
-
-    if count is not None:
-        k = min(count, len(pcd_files))
-    elif fraction is not None:
-        k = max(1, round(len(pcd_files) * fraction))
-    else:
-        k = len(pcd_files)
-
-    if first:
-        selected_pcd = pcd_files[:k]
-    else:
-        selected_pcd = sorted(random.Random(seed).sample(pcd_files, k))
-    LOGGER.info("Selected %d of %d pcd files", len(selected_pcd), len(pcd_files))
-
-    selected_obj: list[str] | None = None
-    if match_obj:
-        stems = {Path(f).stem for f in selected_pcd}
-        selected_obj = sorted(
-            f
-            for f in all_files
-            if f.startswith("obj/") and f.endswith(".npz") and Path(f).stem in stems
+    if not shards:
+        raise RuntimeError(f"No .tar shards found for splits {a.splits}.")
+    if a.num_shards is not None and a.num_shards < len(shards):
+        shards = shards[: a.num_shards] if a.first else sorted(
+            random.Random(a.seed).sample(shards, a.num_shards)
         )
-        LOGGER.info("Matched %d obj files to the selected pcd files", len(selected_obj))
-        if not selected_obj:
-            LOGGER.warning(
-                "No obj files matched the selected pcd stems; check the naming scheme."
-            )
-
-    return selected_pcd, selected_obj
+    LOGGER.info("Using %d shard(s)", len(shards))
+    return shards
 
 
-def build_allow_patterns(
-    pcd_files: list[str] | None,
-    obj_files: list[str] | None,
-    skip_obj: bool,
-) -> list[str]:
-    patterns = list(METADATA_PATTERNS)
-
-    if pcd_files is None:
-        patterns.append("pcd/**")
-    else:
-        patterns.extend(pcd_files)
-
-    if not skip_obj:
-        if obj_files is None:
-            patterns.append("obj/**")
-        else:
-            patterns.extend(obj_files)
-
-    return patterns
+def list_keys(tar_path: Path) -> list[str]:
+    keys = set()
+    with tarfile.open(tar_path) as tf:
+        for m in tf:
+            if m.isfile():
+                key, kind = split_member(m.name)
+                if kind == PCD_KIND:
+                    keys.add(key)
+    return sorted(keys)
 
 
-def copy_root_metadata(staging_dir: Path, destination: Path, overwrite: bool) -> None:
-    LOGGER.info("Copying repository metadata files")
-    for item in staging_dir.iterdir():
-        if item.name in {"obj", "pcd", ".cache"}:
-            continue
-
-        target = destination / item.name
-        if item.is_dir():
-            if target.exists():
-                if not overwrite:
-                    raise FileExistsError(
-                        f"Refusing to overwrite existing directory: {target}. "
-                        "Use --overwrite to replace it."
-                    )
-                shutil.rmtree(target)
-            shutil.copytree(item, target)
-        else:
-            if target.exists() and not overwrite:
-                raise FileExistsError(
-                    f"Refusing to overwrite existing file: {target}. "
-                    "Use --overwrite to replace it."
-                )
-            shutil.copy2(item, target)
-
-
-def move_files(
-    flat_source_dir: Path, pattern: str, flat_target_dir: Path, overwrite: bool
-) -> int:
-    moved = 0
-    for source_path in sorted(flat_source_dir.rglob(pattern)):
-        target_path = flat_target_dir / source_path.name
-        if target_path.exists():
-            if not overwrite:
-                raise FileExistsError(
-                    f"Refusing to overwrite existing file: {target_path}. "
-                    "Use --overwrite to replace it."
-                )
-            target_path.unlink()
-
-        shutil.move(str(source_path), str(target_path))
-        moved += 1
-    return moved
-
-
-def remove_empty_shard_dirs(root: Path) -> None:
-    for path in sorted(root.rglob("*"), reverse=True):
-        if path.is_dir() and not any(path.iterdir()):
-            path.rmdir()
-
-
-def flatten_shards(
-    staging_dir: Path, destination: Path, overwrite: bool, skip_obj: bool
-) -> None:
-    LOGGER.info("Flattening shard directories into %s", destination)
-
-    obj_source_dir = staging_dir / "obj"
-    pcd_source_dir = staging_dir / "pcd"
-    obj_target_dir = destination / "obj"
-    pcd_target_dir = destination / "pcd"
-
-    if not skip_obj and obj_source_dir.exists():
-        obj_target_dir.mkdir(exist_ok=True)
-        obj_count = move_files(
-            obj_source_dir, "*.npz", obj_target_dir, overwrite=overwrite
-        )
-        LOGGER.info("Moved %s object files into %s", obj_count, obj_target_dir)
-        remove_empty_shard_dirs(obj_source_dir)
-
-    if pcd_source_dir.exists():
-        pcd_count = move_files(
-            pcd_source_dir, "*.npy", pcd_target_dir, overwrite=overwrite
-        )
-        LOGGER.info("Moved %s point-cloud files into %s", pcd_count, pcd_target_dir)
-        remove_empty_shard_dirs(pcd_source_dir)
+def extract(tar_path: Path, dest: Path, keep: set[str] | None, a) -> dict[str, int]:
+    counts = {"pcd": 0, "obj": 0, "json": 0}
+    with tarfile.open(tar_path) as tf:
+        for m in tf:
+            if not m.isfile():
+                continue
+            key, kind = split_member(m.name)
+            if keep is not None and key not in keep:
+                continue
+            if kind == PCD_KIND:
+                sub = "pcd"
+            elif kind in OBJ_KINDS and not a.skip_obj:
+                sub = "obj"
+            elif kind == JSON_KIND and not a.skip_json:
+                sub = "json"
+            else:
+                continue
+            target = dest / sub / PurePosixPath(m.name).name
+            if target.exists() and not a.overwrite:
+                raise FileExistsError(f"{target} exists. Use --overwrite to replace it.")
+            target.write_bytes(tf.extractfile(m).read())
+            counts[sub] += 1
+    return counts
 
 
 def main() -> int:
-    args = parse_args()
-    configure_logging()
-    validate_args(args)
+    a = parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format="%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+    validate_args(a)
 
-    destination = args.destination.expanduser().resolve()
-    ensure_destination(destination, skip_obj=args.skip_obj)
+    dest = a.destination.expanduser().resolve()
+    for sub in ("pcd", "obj", "json"):
+        if sub == "obj" and a.skip_obj or sub == "json" and a.skip_json:
+            continue
+        (dest / sub).mkdir(parents=True, exist_ok=True)
 
-    LOGGER.info("Preparing to download dataset %s into %s", REPO_ID, destination)
+    LOGGER.info("Downloading metadata (splits, csv, README)")
+    snapshot_download(REPO_ID, repo_type="dataset", revision=a.revision,
+                      local_dir=dest, allow_patterns=METADATA_PATTERNS,
+                      force_download=a.force_download)
 
-    pcd_files, obj_files = select_files(
-        revision=args.revision,
-        fraction=args.pcd_fraction,
-        count=args.pcd_count,
-        seed=args.seed,
-        first=args.first,
-        skip_obj=args.skip_obj,
-        match_obj=args.match_obj,
-    )
-    allow_patterns = build_allow_patterns(pcd_files, obj_files, args.skip_obj)
-    LOGGER.info("Using %d allow_patterns", len(allow_patterns))
+    shards = choose_shards(a)
 
-    with TemporaryDirectory(
-        prefix="donut_download_", dir=destination.parent
-    ) as tmp_dir:
-        staging_dir = Path(tmp_dir) / "snapshot"
-        LOGGER.info(
-            "Downloading dataset snapshot to temporary staging directory %s",
-            staging_dir,
-        )
-        snapshot_download(
-            repo_id=REPO_ID,
-            repo_type="dataset",
-            revision=args.revision,
-            local_dir=staging_dir,
-            allow_patterns=allow_patterns,
-            force_download=args.force_download,
-            max_workers=1,
-        )
+    with TemporaryDirectory(prefix="donut_shards_", dir=dest.parent) as tmp:
+        tmp = Path(tmp)
+        local = []
+        for s in shards:
+            LOGGER.info("Downloading %s", s)
+            local.append(Path(hf_hub_download(
+                REPO_ID, s, repo_type="dataset", revision=a.revision,
+                local_dir=tmp, force_download=a.force_download)))
 
-        copy_root_metadata(staging_dir, destination, overwrite=args.overwrite)
-        flatten_shards(
-            staging_dir, destination, overwrite=args.overwrite, skip_obj=args.skip_obj
-        )
+        keep = None
+        if a.pcd_count is not None or a.pcd_fraction is not None:
+            all_keys = sorted({k for p in local for k in list_keys(p)})
+            n = (min(a.pcd_count, len(all_keys)) if a.pcd_count is not None
+                 else max(1, round(len(all_keys) * a.pcd_fraction)))
+            chosen = all_keys[:n] if a.first else random.Random(a.seed).sample(all_keys, n)
+            keep = set(chosen)
+            LOGGER.info("Keeping %d of %d samples", n, len(all_keys))
 
-    LOGGER.info("DONUT dataset download and unsharding complete")
+        total = {"pcd": 0, "obj": 0, "json": 0}
+        for p in local:
+            LOGGER.info("Extracting %s", p.name)
+            for k, v in extract(p, dest, keep, a).items():
+                total[k] += v
+            p.unlink()  # free disk as we go (useful on Kaggle)
+
+    LOGGER.info("Done: %d pcd, %d mesh files, %d json files",
+                total["pcd"], total["obj"], total["json"])
     return 0
 
 
