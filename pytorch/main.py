@@ -13,7 +13,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 from torch.optim.lr_scheduler import CosineAnnealingLR
-from data_pyg import ModelNet40PyG
+from data_pyg import get_dataset, NUM_CLASSES
 from dgcnn_ect_gated import DGCNN
 import numpy as np
 from torch.utils.data import DataLoader
@@ -50,9 +50,9 @@ def get_complexity(args, ect_features, device):
 
 
 def train(args, io):
-    train_loader = DataLoader(ModelNet40PyG(partition='train', num_points=args.num_points), num_workers=8,
+    train_loader = DataLoader(get_dataset(args.dataset, 'train', args.num_points), num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(ModelNet40PyG(partition='test', num_points=args.num_points), num_workers=8,
+    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points), num_workers=8,
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
@@ -60,7 +60,7 @@ def train(args, io):
     if args.model == 'pointnet':
         model = PointNet(args).to(device)
     elif args.model == 'dgcnn':
-        model = DGCNN(args, output_channels=40, gate_all_blocks=args.gate_all_blocks).to(device)
+        model = DGCNN(args, output_channels=args.num_classes, gate_all_blocks=args.gate_all_blocks).to(device)
     else:
         raise Exception("Not implemented")
     print(str(model))
@@ -183,12 +183,12 @@ def train(args, io):
 
 
 def test(args, io):
-    test_loader = DataLoader(ModelNet40PyG(partition='test', num_points=args.num_points),
+    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points),
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
 
-    model = DGCNN(args, output_channels=40, gate_all_blocks=args.gate_all_blocks).to(device)
+    model = DGCNN(args, output_channels=args.num_classes, gate_all_blocks=args.gate_all_blocks).to(device)
     model = nn.DataParallel(model)
     model.load_state_dict(torch.load(args.model_path))
     model = model.eval()
@@ -222,7 +222,8 @@ if __name__ == "__main__":
                         choices=['pointnet', 'dgcnn'],
                         help='Model to use, [pointnet, dgcnn]')
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
-                        choices=['modelnet40'])
+                        choices=['modelnet40', 'shapenet'],
+                        help='Dataset to use (shapenet = 16-category object classification)')
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
                         help='Size of batch)')
     parser.add_argument('--test_batch_size', type=int, default=16, metavar='batch_size',
@@ -267,6 +268,7 @@ if __name__ == "__main__":
                         help='[unused for now] see --complexity_method')
 
     args = parser.parse_args()
+    args.num_classes = NUM_CLASSES[args.dataset]
 
     _init_()
 
