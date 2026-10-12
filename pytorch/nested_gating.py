@@ -447,3 +447,270 @@ class DGCNN(nn.Module):
             return self.last_gates[block].mean(dim=1)          # (B,)
         stacked = torch.stack(list(self.last_gates.values()), dim=0)  # (num_blocks, B, N)
         return stacked.mean(dim=0).mean(dim=1)                            # (B,)
+
+
+# ===========================================================================
+# ADDED: segmentation model (bottom branch of the DGCNN paper's Fig. 3) with
+# the same nested block gating as the classification DGCNN above.
+# Everything above this line is the original nested_gating.py, unchanged.
+# ===========================================================================
+class TransformNet(nn.Module):
+    """Spatial transform block: estimates a 3x3 matrix from the edge features
+    (coords + neighbour differences) and applies it to the input points."""
+
+    def __init__(self, k=20):
+        super(TransformNet, self).__init__()
+        self.k = k
+
+        self.bn1 = nn.BatchNorm2d(64)
+        self.bn2 = nn.BatchNorm2d(128)
+        self.bn3 = nn.BatchNorm1d(1024)
+
+        self.conv1 = nn.Sequential(nn.Conv2d(6, 64, kernel_size=1, bias=False),
+                                   self.bn1, nn.LeakyReLU(negative_slope=0.2))
+        self.conv2 = nn.Sequential(nn.Conv2d(64, 128, kernel_size=1, bias=False),
+                                   self.bn2, nn.LeakyReLU(negative_slope=0.2))
+        self.conv3 = nn.Sequential(nn.Conv1d(128, 1024, kernel_size=1, bias=False),
+                                   self.bn3, nn.LeakyReLU(negative_slope=0.2))
+
+        self.linear1 = nn.Linear(1024, 512, bias=False)
+        self.bn4 = nn.BatchNorm1d(512)
+        self.linear2 = nn.Linear(512, 256, bias=False)
+        self.bn5 = nn.BatchNorm1d(256)
+
+        self.transform = nn.Linear(256, 3 * 3)
+        nn.init.constant_(self.transform.weight, 0)
+        nn.init.eye_(self.transform.bias.view(3, 3))  # start at identity
+
+    def forward(self, x):
+        B = x.size(0)
+        t = get_graph_feature(x, k=self.k)       # (B, 6, N, k)
+        t = self.conv1(t)                        # (B, 64, N, k)
+        t = self.conv2(t)                        # (B, 128, N, k)
+        t = t.max(dim=-1, keepdim=False)[0]      # (B, 128, N)
+        t = self.conv3(t)                        # (B, 1024, N)
+        t = t.max(dim=-1, keepdim=False)[0]      # (B, 1024)
+
+        t = F.leaky_relu(self.bn4(self.linear1(t)), negative_slope=0.2)
+        t = F.leaky_relu(self.bn5(self.linear2(t)), negative_slope=0.2)
+        t = self.transform(t).view(B, 3, 3)      # (B, 3, 3)
+
+        return torch.bmm(x.transpose(2, 1), t).transpose(2, 1)  # (B, 3, N)
+
+
+class DGCNN_Seg(nn.Module):
+    """
+    DGCNN part-segmentation network (Fig. 3, bottom branch) with nested
+    block gating.
+
+        point cloud (B,3,N) -> spatial transform
+          -> EdgeConv mlp{64,64}  -> u1 -> [nested gate] -> x1   (64)
+          -> EdgeConv mlp{64,64}  -> u2 -> [nested gate] -> x2   (64)
+          -> EdgeConv mlp{64}     -> u3 -> [nested gate] -> x3   (64)
+          -> concat(x1,x2,x3) (192) -> mlp{1024} -> max pool     (1024)
+          -> concat mlp{64}(category one-hot)                    (1088)
+          -> repeat N, concat (x1,x2,x3)                         (1280)
+          -> mlp{256,256,128,p}                                  (B,p,N)
+
+    Nested gate at block r (same as the classification DGCNN):
+        u = EC_r(f^(r-1));  v = EC_extra,r(u);  g = NestedGate(u, complexity)
+        f^(r) = (1-g) * u + g * v          (replaces u going forward, including
+                                            in the skip concat for the head)
+
+    gate_all_blocks=False (default): gate only EdgeConv 1.
+    gate_all_blocks=True:            gate all three EdgeConv blocks, each with
+                                     its own 64->64 extra EdgeConv + NestedGate.
+
+    num_categories: size of the one-hot object-category vector (16 for
+                    ShapeNet-Part); 0 for datasets without one (S3DIS).
+
+    forward(x, label=None, complexity=None):
+        x (B,3,N); label (B,num_categories) one-hot; complexity (B,N) in [0,1]
+        or None for the ungated baseline.  Returns (B, num_classes, N).
+
+    last_lambda / last_gates / shape_level_gate_score behave exactly as in
+    the classification DGCNN.
+    """
+
+    def __init__(self, args, num_classes=50, num_categories=16,
+                 gate_all_blocks=False, use_transform=True,
+                 learned_gate=False, gate_alpha=4.0):
+        super(DGCNN_Seg, self).__init__()
+        self.args = args
+        self.k = args.k
+        self.num_categories = num_categories
+        self.gate_all_blocks = gate_all_blocks
+        self.gated_blocks = ['conv1', 'conv2', 'conv3'] if gate_all_blocks else ['conv1']
+
+        self.transform_net = TransformNet(k=args.k) if use_transform else None
+
+        # EdgeConv 1: mlp{64, 64}
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(3 * 2, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(negative_slope=0.2),
+            nn.Conv2d(64, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(negative_slope=0.2))
+        # EdgeConv 2: mlp{64, 64}
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(negative_slope=0.2),
+            nn.Conv2d(64, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(negative_slope=0.2))
+        # EdgeConv 3: mlp{64}
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+            nn.BatchNorm2d(64), nn.LeakyReLU(negative_slope=0.2))
+
+        # all three EdgeConv outputs are 64-wide -> one extra 64->64 EdgeConv
+        # + NestedGate per gated block
+        self.extra_convs = nn.ModuleDict()
+        self.nested_gates = nn.ModuleDict()
+        for block in self.gated_blocks:
+            self.extra_convs[block] = nn.Sequential(
+                nn.Conv2d(64 * 2, 64, kernel_size=1, bias=False),
+                nn.BatchNorm2d(64),
+                nn.LeakyReLU(negative_slope=0.2))
+            self.nested_gates[block] = NestedGate(in_channels=64,
+                                                  alpha=gate_alpha,
+                                                  learned=learned_gate)
+
+        # mlp{1024} on concat(x1, x2, x3)
+        self.conv4 = nn.Sequential(
+            nn.Conv1d(192, args.emb_dims, kernel_size=1, bias=False),
+            nn.BatchNorm1d(args.emb_dims), nn.LeakyReLU(negative_slope=0.2))
+
+        # mlp{64} on the categorical vector
+        if num_categories > 0:
+            self.conv_cat = nn.Sequential(
+                nn.Conv1d(num_categories, 64, kernel_size=1, bias=False),
+                nn.BatchNorm1d(64), nn.LeakyReLU(negative_slope=0.2))
+            head_in = args.emb_dims + 64 + 192   # 1280
+        else:
+            self.conv_cat = None
+            head_in = args.emb_dims + 192
+
+        # mlp{256, 256, 128, p}
+        self.conv5 = nn.Sequential(
+            nn.Conv1d(head_in, 256, kernel_size=1, bias=False),
+            nn.BatchNorm1d(256), nn.LeakyReLU(negative_slope=0.2))
+        self.dp1 = nn.Dropout(p=args.dropout)
+        self.conv6 = nn.Sequential(
+            nn.Conv1d(256, 256, kernel_size=1, bias=False),
+            nn.BatchNorm1d(256), nn.LeakyReLU(negative_slope=0.2))
+        self.dp2 = nn.Dropout(p=args.dropout)
+        self.conv7 = nn.Sequential(
+            nn.Conv1d(256, 128, kernel_size=1, bias=False),
+            nn.BatchNorm1d(128), nn.LeakyReLU(negative_slope=0.2))
+        self.conv8 = nn.Conv1d(128, num_classes, kernel_size=1, bias=True)
+
+        self.last_lambda = None
+        self.last_gates = {}
+
+    def _apply_nested_gate(self, block, u, complexity):
+        """f = (1-g) u + g v, with v = EC_extra,block(u)."""
+        v = get_graph_feature(u, k=self.k)
+        v = self.extra_convs[block](v)
+        v = v.max(dim=-1, keepdim=False)[0]              # (B, 64, N)
+
+        g = self.nested_gates[block](u, complexity)      # (B, 1, N)
+        self.last_gates[block] = g.squeeze(1)            # (B, N)
+        return (1 - g) * u + g * v
+
+    def forward(self, x, label=None, complexity=None):
+        B, _, N = x.size()
+        use_gate = complexity is not None
+        if use_gate:
+            self.last_gates = {}
+
+        if self.transform_net is not None:
+            x = self.transform_net(x)
+
+        feat = get_graph_feature(x, k=self.k)
+        x1 = self.conv1(feat).max(dim=-1, keepdim=False)[0]          # (B, 64, N)
+        if use_gate and 'conv1' in self.gated_blocks:
+            x1 = self._apply_nested_gate('conv1', x1, complexity)
+
+        feat = get_graph_feature(x1, k=self.k)
+        x2 = self.conv2(feat).max(dim=-1, keepdim=False)[0]          # (B, 64, N)
+        if use_gate and 'conv2' in self.gated_blocks:
+            x2 = self._apply_nested_gate('conv2', x2, complexity)
+
+        feat = get_graph_feature(x2, k=self.k)
+        x3 = self.conv3(feat).max(dim=-1, keepdim=False)[0]          # (B, 64, N)
+        if use_gate and 'conv3' in self.gated_blocks:
+            x3 = self._apply_nested_gate('conv3', x3, complexity)
+
+        local = torch.cat((x1, x2, x3), dim=1)                       # (B, 192, N)
+        g_feat = self.conv4(local).max(dim=-1, keepdim=True)[0]      # (B, 1024, 1)
+
+        if self.conv_cat is not None:
+            if label is None:
+                raise ValueError("label (B, num_categories) is required when "
+                                 "num_categories > 0")
+            cat = self.conv_cat(label.view(B, -1, 1))                # (B, 64, 1)
+            g_feat = torch.cat((g_feat, cat), dim=1)                 # (B, 1088, 1)
+
+        g_feat = g_feat.repeat(1, 1, N)
+        feat = torch.cat((g_feat, x1, x2, x3), dim=1)                # (B, 1280, N)
+
+        feat = self.dp1(self.conv5(feat))
+        feat = self.dp2(self.conv6(feat))
+        feat = self.conv7(feat)
+        out = self.conv8(feat)                                       # (B, p, N)
+
+        if use_gate and self.last_gates:
+            self.last_lambda = torch.cat(
+                [g.reshape(-1) for g in self.last_gates.values()]
+            ).mean().item()
+        else:
+            self.last_lambda = None
+        return out
+
+    def shape_level_gate_score(self, block=None):
+        """Mean-pooled gate per shape, (B,). Same as the classification model."""
+        if not self.last_gates:
+            raise RuntimeError("Run a forward pass with complexity != None first.")
+        if block is not None:
+            return self.last_gates[block].mean(dim=1)
+        stacked = torch.stack(list(self.last_gates.values()), dim=0)
+        return stacked.mean(dim=0).mean(dim=1)
+
+
+def build_model(task, args, num_classes, num_categories=16,
+                gate_all_blocks=False, use_transform=True,
+                learned_gate=False, gate_alpha=4.0):
+    """task: "cls" or "seg".  use_transform / num_categories: seg only."""
+    task = task.lower()
+    if task in ("cls", "classification"):
+        return DGCNN(args, output_channels=num_classes,
+                     gate_all_blocks=gate_all_blocks,
+                     learned_gate=learned_gate, gate_alpha=gate_alpha)
+    if task in ("seg", "segmentation"):
+        return DGCNN_Seg(args, num_classes=num_classes,
+                         num_categories=num_categories,
+                         gate_all_blocks=gate_all_blocks,
+                         use_transform=use_transform,
+                         learned_gate=learned_gate, gate_alpha=gate_alpha)
+    raise ValueError("unknown task '%s' (expected 'cls' or 'seg')" % task)
+
+
+if __name__ == "__main__":
+    class Args:
+        k = 20
+        emb_dims = 1024
+        dropout = 0.5
+
+    args = Args()
+    B, N = 4, 1024
+    x = torch.randn(B, 3, N)
+    g = torch.rand(B, N)
+    label = F.one_hot(torch.randint(0, 16, (B,)), 16).float()
+
+    for all_blocks in (False, True):
+        cls = build_model("cls", args, num_classes=40, gate_all_blocks=all_blocks)
+        seg = build_model("seg", args, num_classes=50, gate_all_blocks=all_blocks)
+        print("all_blocks=%s" % all_blocks)
+        print("  cls plain:", tuple(cls(x).shape))
+        print("  cls gated:", tuple(cls(x, complexity=g).shape), "mean gate =", cls.last_lambda)
+        print("  seg plain:", tuple(seg(x, label).shape))
+        print("  seg gated:", tuple(seg(x, label, complexity=g).shape), "mean gate =", seg.last_lambda)

@@ -5,7 +5,8 @@ from torch_geometric.datasets import ModelNet, ShapeNet
 from torch_geometric.transforms import Compose, SamplePoints, NormalizeScale, FixedPoints
 from complexity_score import compute_complexity_score
 
-NUM_CLASSES = {'modelnet40': 40, 'shapenet': 16}
+# 'shapenetpart' is the part-segmentation task: 50 global part labels (0..49)
+NUM_CLASSES = {'modelnet40': 40, 'shapenet': 16, 'shapenetpart': 50}
 
 
 class TranslatePointCloud:
@@ -17,9 +18,17 @@ class TranslatePointCloud:
 
 
 class ShufflePoints:
+    """Shuffle point order. Every per-point attribute must be permuted with the
+    same permutation, otherwise part-segmentation labels (data.y) would no
+    longer line up with data.pos. Graph-level attributes (e.g. ModelNet's
+    y of shape (1,)) are left alone by the size check."""
     def __call__(self, data):
-        perm = torch.randperm(data.pos.size(0))
-        data.pos = data.pos[perm]
+        n = data.pos.size(0)
+        perm = torch.randperm(n)
+        for key in ('pos', 'y', 'x'):
+            v = getattr(data, key, None)
+            if torch.is_tensor(v) and v.dim() > 0 and v.size(0) == n:
+                setattr(data, key, v[perm])
         return data
 
 
@@ -80,9 +89,27 @@ class ShapeNetPyG(Dataset):
         return len(self.dataset)
 
 
+class ShapeNetPartPyG(ShapeNetPyG):
+    """
+    ShapeNet part SEGMENTATION. Returns
+        (pointcloud (N,3), ect_features (N,), category (1,), part_labels (N,))
+    part_labels are PyG's global part ids 0..49; category is 0..15 in the
+    standard (alphabetical) ShapeNet-Part order.
+    """
+    def __getitem__(self, item):
+        data = self.dataset[item]
+        pointcloud = data.pos[:self.num_points]         # (N, 3)
+        ect_features = compute_complexity_score(data)   # (N,)  must be aligned with data.pos
+        category = data.category.view(-1)               # (1,)
+        part_labels = data.y[:self.num_points].long()   # (N,)
+        return pointcloud, ect_features, category, part_labels
+
+
 def get_dataset(name, partition, num_points):
     if name == 'modelnet40':
         return ModelNet40PyG(num_points=num_points, partition=partition)
     if name == 'shapenet':
         return ShapeNetPyG(num_points=num_points, partition=partition)
+    if name == 'shapenetpart':
+        return ShapeNetPartPyG(num_points=num_points, partition=partition)
     raise ValueError(f'Unknown dataset: {name}')
