@@ -5,7 +5,7 @@
 @File: main_edge.py
 
 Training / evaluation for DGCNN + ECT-gated edge reweighting (edge_weights.py).
-    --task cls : object classification  (modelnet40 / shapenet)
+    --task cls : object classification  (modelnet40 / shapenet / donut_genus / donut_components)
     --task seg : part segmentation      (shapenetpart)
 """
 
@@ -255,9 +255,9 @@ def make_model(args, device):
 
 
 def train(args, io):
-    train_loader = DataLoader(get_dataset(args.dataset, 'train', args.num_points), num_workers=8,
+    train_loader = DataLoader(get_dataset(args.dataset, 'train', args.num_points, args.donut_fraction), num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points), num_workers=8,
+    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points, args.donut_fraction), num_workers=8,
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
@@ -302,7 +302,7 @@ def train(args, io):
 
 
 def test(args, io):
-    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points),
+    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points, args.donut_fraction),
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
@@ -330,9 +330,15 @@ if __name__ == "__main__":
                         choices=['pointnet', 'dgcnn'],
                         help='Model to use, [pointnet, dgcnn] (pointnet: --task cls only)')
     parser.add_argument('--dataset', type=str, default='modelnet40', metavar='N',
-                        choices=['modelnet40', 'shapenet', 'shapenetpart'],
-                        help='modelnet40 / shapenet (16-category classification) for --task cls; '
-                             'shapenetpart for --task seg')
+                        choices=['modelnet40', 'shapenet', 'shapenetpart',
+                                 'donut_genus', 'donut_components'],
+                        help='modelnet40 / shapenet (16-category classification) / '
+                             'donut_genus / donut_components (DONUT topology classification) '
+                             'for --task cls; shapenetpart for --task seg')
+    parser.add_argument('--donut_fraction', type=float, default=1.0,
+                        help='DONUT only: fraction (0, 1] of the train and test shards to '
+                             'download/use. Use e.g. 0.1 for a quick debug run (~5 GB) and 1.0 '
+                             'for the full dataset; raising it later downloads only the extra shards.')
     parser.add_argument('--batch_size', type=int, default=32, metavar='batch_size',
                         help='Size of batch)')
     parser.add_argument('--test_batch_size', type=int, default=16, metavar='batch_size',
