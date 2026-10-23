@@ -248,9 +248,9 @@ def make_model(args, device):
 
 
 def train(args, io):
-    train_loader = DataLoader(get_dataset(args.dataset, 'train', args.num_points, args.donut_fraction), num_workers=8,
+    train_loader = DataLoader(get_dataset(args.dataset, 'train', args.num_points, args.complexity_method,args.donut_fraction), num_workers=8,
                               batch_size=args.batch_size, shuffle=True, drop_last=True)
-    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points, args.donut_fraction), num_workers=8,
+    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points, args.complexity_method, args.donut_fraction), num_workers=8,
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
