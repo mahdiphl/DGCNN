@@ -60,16 +60,17 @@ def build_transform(num_points, train, from_mesh):
 
 class ModelNet40PyG(Dataset):
     """Wraps torch_geometric ModelNet, returns (pointcloud, ect_features, label)."""
-    def __init__(self, num_points, partition='train'):
+    def __init__(self, num_points, partition='train', complexity_method='entropy'):
         transform = build_transform(num_points, partition == 'train', from_mesh=True)
         self.dataset = ModelNet(root='data/ModelNet40', name='40',
                                 train=(partition == 'train'), transform=transform)
         self.num_points = num_points
+        self.complexity_method = complexity_method
 
     def __getitem__(self, item):
         data = self.dataset[item]
         pointcloud = data.pos[:self.num_points]         # (N, 3)
-        ect_features = compute_complexity_score(data)   # (N,)
+        ect_features = compute_complexity_score(data, self.complexity_method)   # (N,)
         label = data.y                                  # (1,)
         return pointcloud, ect_features, label
 
@@ -288,10 +289,10 @@ class DonutPyG(Dataset):
         return len(self.ids)
 
 
-def get_dataset(name, partition, num_points, fraction=1.0):
+def get_dataset(name, partition, num_points, complexity_method, fraction=1.0):
     """fraction (0, 1] only applies to the DONUT datasets (fraction of shards to download/use)."""
     if name == 'modelnet40':
-        return ModelNet40PyG(num_points=num_points, partition=partition)
+        return ModelNet40PyG(num_points=num_points, partition=partition, complexity_method=complexity_method)
     if name == 'shapenet':
         return ShapeNetPyG(num_points=num_points, partition=partition)
     if name == 'shapenetpart':

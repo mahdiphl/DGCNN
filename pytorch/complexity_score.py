@@ -36,6 +36,6 @@ def compute_complexity_score(data, method='entropy'):
     #data = Data(pos=xyz)
     data = ect_transform(data)
     ect = compute_local_ect(data, radius=1, ECT_TYPE='points')
-    complexity = compute_complexity(ect, num_thetas=64, method="entropy")
+    complexity = compute_complexity(ect, num_thetas=64, method=method)
     return complexity
 
