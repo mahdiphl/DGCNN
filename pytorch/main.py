@@ -295,7 +295,7 @@ def train(args, io):
 
 
 def test(args, io):
-    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points, args.donut_fraction),
+    test_loader = DataLoader(get_dataset(args.dataset, 'test', args.num_points, args.complexity_method, args.donut_fraction),
                              batch_size=args.test_batch_size, shuffle=True, drop_last=False)
 
     device = torch.device("cuda" if args.cuda else "cpu")
